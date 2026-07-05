@@ -72,22 +72,42 @@ def write_peb(path: Path, new_text: str, report: Report, dry_run: bool):
 
 
 def sub_line_end_token(text: str, pattern: str, repl_token_name: str,
-                        trailing_spaces: int = 1):
+                        trailing_spaces: int = 1, space_after_suffix: bool = False):
     """
-    Replace the value in group 2 of `pattern` with a Pebble token,
-    inserting `trailing_spaces` sacrificial spaces right after the token
-    (before whatever originally followed it on that line). `pattern` must
-    have exactly three capturing groups: (prefix)(value-to-replace)(suffix).
-    Always applied with re.MULTILINE so ^/$ anchors in patterns match
-    per-line rather than only at the start/end of the whole file.
+    Replace the value in group 2 of `pattern` with a Pebble token, inserting
+    `trailing_spaces` sacrificial spaces immediately after the token unless
+    `space_after_suffix` is set, in which case the spaces go after group 3
+    instead (used when group 3 is a closing quote, so the quote sits right
+    against the token and doesn't get eaten). `pattern` must have exactly
+    three capturing groups: (prefix)(value-to-replace)(suffix). Always
+    applied with re.MULTILINE so ^/$ anchors in patterns match per-line
+    rather than only at the start/end of the whole file.
     """
     tok = token(repl_token_name)
 
     def _repl(m):
+        if space_after_suffix:
+            return m.group(1) + tok + m.group(3) + (" " * trailing_spaces)
         return m.group(1) + tok + (" " * trailing_spaces) + m.group(3)
 
     new_text, n = re.subn(pattern, _repl, text, flags=re.MULTILINE)
     return new_text, n
+
+
+def sub_first_match_token(text: str, patterns, repl_token_name: str,
+                           trailing_spaces: int = 1, space_after_suffix: bool = False):
+    """
+    Try each candidate pattern (Kotlin DSL vs. Groovy DSL variants, e.g.) in
+    turn and apply the first one that matches. Since the two DSLs use
+    mutually exclusive syntax (`=` and double quotes vs. bare assignment and
+    single/double quotes), only one pattern is ever expected to match a
+    given file.
+    """
+    for pattern in patterns:
+        new_text, n = sub_line_end_token(text, pattern, repl_token_name, trailing_spaces, space_after_suffix)
+        if n:
+            return new_text, n
+    return text, 0
 
 
 def process_gradle_wrapper(project_dir: Path, report: Report, dry_run: bool):
@@ -130,13 +150,20 @@ def process_settings_gradle(project_dir: Path, report: Report, dry_run: bool):
 def process_root_build_gradle(project_dir: Path, report: Report, dry_run: bool):
     path = project_dir / "build.gradle.kts"
     if not path.exists():
-        report.skip(f"{path} not found")
+        path = project_dir / "build.gradle"
+    if not path.exists():
+        report.skip(f"{project_dir / 'build.gradle.kts'} or build.gradle not found")
         return
     text = path.read_text(encoding="utf-8")
-    new_text, n = sub_line_end_token(
+    new_text, n = sub_first_match_token(
         text,
-        r'(id\("com\.android\.(?:application|library)"\)\s+apply\s+false\s+version\s+")([^"]+)(")',
+        [
+            r'(id\("com\.android\.(?:application|library)"\)\s+apply\s+false\s+version\s+")([^"]+)(")',
+            r"(id\s+'com\.android\.(?:application|library)'\s+apply\s+false\s+version\s+')([^']+)(')",
+            r'(id\s+"com\.android\.(?:application|library)"\s+apply\s+false\s+version\s+")([^"]+)(")',
+        ],
         "AGP_VERSION",
+        space_after_suffix=True,
     )
     if n == 0:
         report.skip(f"{path}: no 'apply false version' plugin lines found, no changes made")
@@ -148,54 +175,138 @@ def process_root_build_gradle(project_dir: Path, report: Report, dry_run: bool):
 def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry_run: bool):
     path = project_dir / module / "build.gradle.kts"
     if not path.exists():
-        report.skip(f"{path} not found")
+        path = project_dir / module / "build.gradle"
+    if not path.exists():
+        report.skip(f"{project_dir / module / 'build.gradle.kts'} or build.gradle not found")
         return
     text = path.read_text(encoding="utf-8")
     total = 0
 
-    # com.android.application plugin version
-    text, n = sub_line_end_token(
+    # com.android.application plugin version (Kotlin DSL, then Groovy single/double quotes)
+    text, n = sub_first_match_token(
         text,
-        r'(id\("com\.android\.application"\)\s+version\s+")([^"]+)(")',
+        [
+            r'(id\("com\.android\.application"\)\s+version\s+")([^"]+)(")',
+            r"(id\s+'com\.android\.application'\s+version\s+')([^']+)(')",
+            r'(id\s+"com\.android\.application"\s+version\s+")([^"]+)(")',
+        ],
         "AGP_VERSION",
+        space_after_suffix=True,
     )
     total += n
 
-    # kotlin("android") plugin version, wrapped in a Pebble LANGUAGE conditional
-    kotlin_pattern = re.compile(
+    # Kotlin plugin version, wrapped in a Pebble LANGUAGE conditional. Tries
+    # Kotlin DSL's kotlin("android") shorthand, then Groovy's `id '...'` form
+    # (either the org.jetbrains.kotlin.android id or the kotlin-android alias).
+    kts_kotlin_pattern = re.compile(
         r'^([ \t]*)kotlin\("android"\)\s+version\s+"([^"]+)"[ \t]*\r?\n?',
         re.MULTILINE,
     )
-    m = kotlin_pattern.search(text)
+    groovy_kotlin_pattern = re.compile(
+        r"^([ \t]*)id\s+(['\"])(?:org\.jetbrains\.kotlin\.android|kotlin-android)\2"
+        r"\s+version\s+\2([^'\"]+)\2[ \t]*\r?\n?",
+        re.MULTILINE,
+    )
+    m = kts_kotlin_pattern.search(text)
     if m:
         indent = m.group(1)
+        plugin_line = f'kotlin("android") version "{token("KOTLIN_VERSION")}" '
+    else:
+        m = groovy_kotlin_pattern.search(text)
+        if m:
+            indent, quote = m.group(1), m.group(2)
+            plugin_line = (
+                f"id {quote}org.jetbrains.kotlin.android{quote} "
+                f"version {quote}{token('KOTLIN_VERSION')}{quote} "
+            )
+
+    if m:
         replacement = (
             f'{indent}${{% if LANGUAGE == \'kotlin\' %}} \n'
-            f'{indent}kotlin("android") version "{token("KOTLIN_VERSION")} "\n'
+            f'{indent}{plugin_line}\n'
             f'{indent}${{% endif %}} \n'
         )
         text = text[:m.start()] + replacement + text[m.end():]
         total += 1
-        report.ok(f"{path}: wrapped kotlin(\"android\") plugin in LANGUAGE conditional")
+        report.ok(f"{path}: wrapped Kotlin plugin declaration in LANGUAGE conditional")
     else:
-        report.skip(f"{path}: kotlin(\"android\") plugin line not found (ok for Java-only projects)")
+        report.skip(f"{path}: Kotlin plugin line not found (ok for Java-only projects)")
 
-    text, n = sub_line_end_token(text, r'(namespace\s*=\s*")([^"]+)(")', "PACKAGE_NAME")
-    total += n
-    text, n = sub_line_end_token(text, r'(compileSdk\s*=\s*)(\d+)()', "COMPILE_SDK")
-    total += n
-    text, n = sub_line_end_token(text, r'(applicationId\s*=\s*")([^"]+)(")', "PACKAGE_NAME")
-    total += n
-    text, n = sub_line_end_token(text, r'(minSdk\s*=\s*)(\d+)()', "MIN_SDK")
-    total += n
-    text, n = sub_line_end_token(text, r'(targetSdk\s*=\s*)(\d+)()', "TARGET_SDK")
-    total += n
-    text, n = sub_line_end_token(
-        text, r'(sourceCompatibility\s*=\s*)(JavaVersion\.\w+|[\d.]+)()', "JAVA_SOURCE_COMPAT"
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(namespace\s*=\s*")([^"]+)(")',
+            r"(namespace\s+')([^']+)(')",
+            r'(namespace\s+")([^"]+)(")',
+        ],
+        "PACKAGE_NAME",
+        space_after_suffix=True,
     )
     total += n
-    text, n = sub_line_end_token(
-        text, r'(targetCompatibility\s*=\s*)(JavaVersion\.\w+|[\d.]+)()', "JAVA_TARGET_COMPAT"
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(compileSdk\s*=\s*)(\d+)()',
+            r'(compileSdk(?:Version)?\s+)(\d+)()',
+        ],
+        "COMPILE_SDK",
+    )
+    total += n
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(applicationId\s*=\s*")([^"]+)(")',
+            r"(applicationId\s+')([^']+)(')",
+            r'(applicationId\s+")([^"]+)(")',
+        ],
+        "PACKAGE_NAME",
+        space_after_suffix=True,
+    )
+    total += n
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(minSdk\s*=\s*)(\d+)()',
+            r'(minSdk(?:Version)?\s+)(\d+)()',
+        ],
+        "MIN_SDK",
+    )
+    total += n
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(targetSdk\s*=\s*)(\d+)()',
+            r'(targetSdk(?:Version)?\s+)(\d+)()',
+        ],
+        "TARGET_SDK",
+    )
+    total += n
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(sourceCompatibility\s*=\s*)(JavaVersion\.\w+|[\d.]+)()',
+            r'(sourceCompatibility\s+)(JavaVersion\.\w+|[\d.]+)()',
+        ],
+        "JAVA_SOURCE_COMPAT",
+    )
+    total += n
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(targetCompatibility\s*=\s*)(JavaVersion\.\w+|[\d.]+)()',
+            r'(targetCompatibility\s+)(JavaVersion\.\w+|[\d.]+)()',
+        ],
+        "JAVA_TARGET_COMPAT",
+    )
+    total += n
+    text, n = sub_first_match_token(
+        text,
+        [
+            r'(jvmTarget\s*=\s*")([^"]+)(")',
+            r"(jvmTarget\s*=\s*')([^']+)(')",
+        ],
+        "JAVA_TARGET_COMPAT",
+        space_after_suffix=True,
     )
     total += n
 
@@ -353,10 +464,10 @@ def main():
     print("\n-- settings.gradle.kts --")
     process_settings_gradle(project_dir, report, args.dry_run)
 
-    print("\n-- build.gradle.kts (root) --")
+    print("\n-- build.gradle.kts / build.gradle (root) --")
     process_root_build_gradle(project_dir, report, args.dry_run)
 
-    print(f"\n-- {args.module}/build.gradle.kts --")
+    print(f"\n-- {args.module}/build.gradle.kts / build.gradle --")
     process_app_build_gradle(project_dir, args.module, report, args.dry_run)
 
     print(f"\n-- {args.module}/src/main/res/values/strings.xml --")

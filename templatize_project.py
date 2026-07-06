@@ -31,7 +31,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+COPY_IGNORE = shutil.ignore_patterns(".git", ".gradle", ".cg", ".idea")
 
 TOKEN = "{name} "  # placeholder, formatted per-use as ${{{{{name}}}}}
 
@@ -531,7 +534,18 @@ def create_template_bundle(project_dir: Path, module: str, output_dir: Path,
         if dest.exists():
             print(f"  would remove existing {dest}")
         print(f"  would copy {project_dir} -> {dest}")
-        run_pipeline(dest, module, dry_run, skip_cleanup, report)
+
+        # Preview against a disposable copy in a temp dir rather than `dest`
+        # itself, so a dry run can never touch anything that already exists
+        # at the real output path.
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"{template_name}-dryrun-"))
+        tmp_dest = tmp_root / template_name
+        try:
+            shutil.copytree(project_dir, tmp_dest, ignore=COPY_IGNORE)
+            run_pipeline(tmp_dest, module, dry_run, skip_cleanup, report)
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
         print(f"\n  would write {output_dir / 'templates.json'}")
         print(f"  would write {dest / 'template' / 'template.json'}")
         print(f"  would write {dest / 'template' / 'icon.png'}")
@@ -545,7 +559,7 @@ def create_template_bundle(project_dir: Path, module: str, output_dir: Path,
         shutil.rmtree(dest)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(project_dir, dest, ignore=shutil.ignore_patterns(".git", ".gradle", ".cg", ".idea"))
+    shutil.copytree(project_dir, dest, ignore=COPY_IGNORE)
     report.ok(f"{project_dir} -> {dest}")
 
     run_pipeline(dest, module, dry_run, skip_cleanup, report)

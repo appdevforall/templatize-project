@@ -403,6 +403,42 @@ def process_java_kt_sources(project_dir: Path, module: str, base_package: str,
         write_peb(path, text, report, dry_run)
 
 
+def flatten_package_directory(project_dir: Path, module: str, base_package: str,
+                               report: Report, dry_run: bool):
+    """
+    Move the base package's directory tree under src/main/java (e.g.
+    com/example/jme2, including any subpackages nested beneath it) into a
+    single directory literally named PACKAGE_NAME, then remove whatever
+    now-empty parent directories (e.g. com/example) it leaves behind.
+    """
+    if not base_package:
+        report.skip("no base package found, skipping java/ package directory flattening")
+        return
+
+    java_root = project_dir / module / "src" / "main" / "java"
+    if not java_root.is_dir():
+        report.skip(f"{java_root} not found")
+        return
+
+    pkg_dir = java_root.joinpath(*base_package.split("."))
+    if not pkg_dir.is_dir():
+        report.skip(f"{pkg_dir} not found, skipping java/ package directory flattening")
+        return
+
+    target_dir = java_root / "PACKAGE_NAME"
+    report.ok(f"{pkg_dir} -> {target_dir}")
+    if dry_run:
+        return
+
+    shutil.move(str(pkg_dir), str(target_dir))
+
+    parent = pkg_dir.parent
+    while parent != java_root and parent.is_dir() and not any(parent.iterdir()):
+        next_parent = parent.parent
+        parent.rmdir()
+        parent = next_parent
+
+
 def cleanup_build_dirs(project_dir: Path, report: Report, dry_run: bool):
     # Match both the original files and any already-renamed .peb versions,
     # since this runs after the file substitution steps.
@@ -473,6 +509,9 @@ def run_pipeline(project_dir: Path, module: str, dry_run: bool, skip_cleanup: bo
 
     print(f"\n-- {module}/src/main/**/*.java, *.kt --")
     process_java_kt_sources(project_dir, module, base_package, report, dry_run)
+
+    print(f"\n-- {module}/src/main/java package directory --")
+    flatten_package_directory(project_dir, module, base_package, report, dry_run)
 
     if not skip_cleanup:
         print("\n-- Removing build/ directories --")

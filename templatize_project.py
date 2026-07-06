@@ -29,6 +29,7 @@ import base64
 import json
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -180,9 +181,31 @@ def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry
         path = project_dir / module / "build.gradle"
     if not path.exists():
         report.skip(f"{project_dir / module / 'build.gradle.kts'} or build.gradle not found")
-        return
+        return None
     text = path.read_text(encoding="utf-8")
     total = 0
+
+    namespace_patterns = [
+        r'(namespace\s*=\s*")([^"]+)(")',
+        r"(namespace\s+')([^']+)(')",
+        r'(namespace\s+")([^"]+)(")',
+    ]
+    application_id_patterns = [
+        r'(applicationId\s*=\s*")([^"]+)(")',
+        r"(applicationId\s+')([^']+)(')",
+        r'(applicationId\s+")([^"]+)(")',
+    ]
+
+    def _find_first(patterns):
+        for pattern in patterns:
+            m = re.search(pattern, text, re.MULTILINE)
+            if m:
+                return m.group(2)
+        return None
+
+    # Captured before substitution runs below, so it reflects the concrete
+    # package name even though the build.gradle occurrence gets tokenized.
+    base_package = _find_first(namespace_patterns) or _find_first(application_id_patterns)
 
     # com.android.application plugin version (Kotlin DSL, then Groovy single/double quotes)
     text, n = sub_first_match_token(
@@ -236,11 +259,7 @@ def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry
 
     text, n = sub_first_match_token(
         text,
-        [
-            r'(namespace\s*=\s*")([^"]+)(")',
-            r"(namespace\s+')([^']+)(')",
-            r'(namespace\s+")([^"]+)(")',
-        ],
+        namespace_patterns,
         "PACKAGE_NAME",
         space_after_suffix=True,
     )
@@ -256,11 +275,7 @@ def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry
     total += n
     text, n = sub_first_match_token(
         text,
-        [
-            r'(applicationId\s*=\s*")([^"]+)(")',
-            r"(applicationId\s+')([^']+)(')",
-            r'(applicationId\s+")([^"]+)(")',
-        ],
+        application_id_patterns,
         "PACKAGE_NAME",
         space_after_suffix=True,
     )
@@ -314,9 +329,10 @@ def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry
 
     if total == 0:
         report.skip(f"{path}: no recognized patterns found, no changes made")
-        return
+        return base_package
     report.ok(f"{path}: made {total} substitution(s)")
     write_peb(path, text, report, dry_run)
+    return base_package
 
 
 def process_strings_xml(project_dir: Path, module: str, report: Report, dry_run: bool):
@@ -336,76 +352,52 @@ def process_strings_xml(project_dir: Path, module: str, report: Report, dry_run:
     write_peb(path, new_text, report, dry_run)
 
 
-def process_main_activity_kt(project_dir: Path, module: str, report: Report, dry_run: bool):
-    path = project_dir / module / "src" / "main" / "java" / "MainActivity.kt"
-    if not path.exists():
-        report.skip(f"{path} not found (ok if this project is Java-only)")
+def process_java_kt_sources(project_dir: Path, module: str, base_package: str,
+                             report: Report, dry_run: bool):
+    """
+    Replace every occurrence of the app's base package (as found in the
+    module build.gradle) with the PACKAGE_NAME token across all .java and
+    .kt files under the module's source tree - both in `package ...`
+    declarations and in `import ...` statements that reference the base
+    package or one of its subpackages (e.g. `<base>.databinding.XxxBinding`).
+    """
+    if not base_package:
+        report.skip(
+            f"{project_dir / module}: no base package found in build.gradle, "
+            "skipping .java/.kt package substitution"
+        )
         return
-    text = path.read_text(encoding="utf-8")
-    pkg_match = re.search(r'^package\s+([\w.]+)\s*$', text, re.MULTILINE)
-    if not pkg_match:
-        report.skip(f"{path}: package declaration not found, no changes made")
+
+    src_main = project_dir / module / "src" / "main"
+    source_files = sorted(src_main.rglob("*.java")) + sorted(src_main.rglob("*.kt"))
+    if not source_files:
+        report.skip(f"{src_main}: no .java/.kt source files found")
         return
-    package_name = pkg_match.group(1)
 
-    text, n = sub_line_end_token(text, r'^(package\s+)([\w.]+)([ \t]*)$', "PACKAGE_NAME")
-    total = n
+    base_escaped = re.escape(base_package)
 
-    # Optional: import <package>.databinding.XxxBinding
-    import_pattern = re.compile(
-        rf'^(import\s+){re.escape(package_name)}(\.databinding\.\w+)([ \t]*)$',
-        re.MULTILINE,
-    )
-    text, n2 = import_pattern.subn(
-        lambda m: f'{m.group(1)}{token("PACKAGE_NAME")} {m.group(2)}{m.group(3)}',
-        text,
-    )
-    total += n2
+    for path in source_files:
+        text = path.read_text(encoding="utf-8")
+        is_java = path.suffix == ".java"
 
-    if total == 0:
-        report.skip(f"{path}: no substitutions made")
-        return
-    report.ok(f"{path}: made {total} substitution(s)")
-    write_peb(path, text, report, dry_run)
+        if is_java:
+            package_pattern = rf'^([ \t]*package[ \t]+)({base_escaped})((?:\.[\w.]*)?[ \t]*;[ \t]*)$'
+            import_pattern = rf'^([ \t]*import[ \t]+)({base_escaped})((?:\.[\w.*]*)?[ \t]*;[ \t]*)$'
+        else:
+            package_pattern = rf'^([ \t]*package[ \t]+)({base_escaped})((?:\.[\w.]*)?[ \t]*)$'
+            import_pattern = rf'^([ \t]*import[ \t]+)({base_escaped})((?:\.[\w.*]*)?[ \t]*)$'
 
+        text, n1 = sub_line_end_token(text, package_pattern, "PACKAGE_NAME")
+        # No sacrificial space here: unlike other substitutions, imports are
+        # always followed by more package/class path text, not eaten by Pebble.
+        text, n2 = sub_line_end_token(text, import_pattern, "PACKAGE_NAME", trailing_spaces=0)
+        total = n1 + n2
 
-def process_main_activity_java(project_dir: Path, module: str, report: Report, dry_run: bool):
-    path = project_dir / module / "src" / "main" / "java" / "MainActivity.java"
-    if not path.exists():
-        report.skip(f"{path} not found (ok if this project is Kotlin-only)")
-        return
-    text = path.read_text(encoding="utf-8")
-    pkg_match = re.search(r'^package[ \t]+([\w.]+)[ \t]*;[ \t]*$', text, re.MULTILINE)
-    if not pkg_match:
-        report.skip(f"{path}: package declaration not found, no changes made")
-        return
-    package_name = pkg_match.group(1)
-
-    # package <pkg>; -> package ${{PACKAGE_NAME}} ;
-    # (space before the semicolon protects it from being eaten)
-    text, n = re.subn(
-        r'^(package[ \t]+)([\w.]+)([ \t]*;[ \t]*)$',
-        lambda m: f'{m.group(1)}{token("PACKAGE_NAME")} ;',
-        text,
-        flags=re.MULTILINE,
-    )
-    total = n
-
-    import_pattern = re.compile(
-        rf'^(import[ \t]+){re.escape(package_name)}(\.databinding\.\w+)([ \t]*;[ \t]*)$',
-        re.MULTILINE,
-    )
-    text, n2 = import_pattern.subn(
-        lambda m: f'{m.group(1)}{token("PACKAGE_NAME")} {m.group(2)};',
-        text,
-    )
-    total += n2
-
-    if total == 0:
-        report.skip(f"{path}: no substitutions made")
-        return
-    report.ok(f"{path}: made {total} substitution(s)")
-    write_peb(path, text, report, dry_run)
+        if total == 0:
+            report.skip(f"{path}: no substitutions made")
+            continue
+        report.ok(f"{path}: made {total} substitution(s)")
+        write_peb(path, text, report, dry_run)
 
 
 def cleanup_build_dirs(project_dir: Path, report: Report, dry_run: bool):
@@ -433,6 +425,21 @@ def cleanup_keystores(project_dir: Path, report: Report, dry_run: bool):
                 f.unlink()
 
 
+def run_gradlew_clean(project_dir: Path, report: Report, dry_run: bool):
+    gradlew = project_dir / ("gradlew.bat" if sys.platform == "win32" else "gradlew")
+    if not gradlew.exists():
+        report.skip(f"{gradlew} not found, skipping gradlew clean")
+        return
+    if dry_run:
+        report.ok(f"would run {gradlew} clean")
+        return
+    result = subprocess.run([str(gradlew), "clean"], cwd=project_dir)
+    if result.returncode != 0:
+        print(f"Error: {gradlew} clean failed with exit code {result.returncode}", file=sys.stderr)
+        sys.exit(1)
+    report.ok(f"{gradlew} clean")
+
+
 def flag_personal_info_files(project_dir: Path, report: Report):
     candidates = ["local.properties", "google-services.json", "key.properties",
                   "GoogleService-Info.plist"]
@@ -456,16 +463,13 @@ def run_pipeline(project_dir: Path, module: str, dry_run: bool, skip_cleanup: bo
     process_root_build_gradle(project_dir, report, dry_run)
 
     print(f"\n-- {module}/build.gradle.kts / build.gradle --")
-    process_app_build_gradle(project_dir, module, report, dry_run)
+    base_package = process_app_build_gradle(project_dir, module, report, dry_run)
 
     print(f"\n-- {module}/src/main/res/values/strings.xml --")
     process_strings_xml(project_dir, module, report, dry_run)
 
-    print(f"\n-- {module}/src/main/java/MainActivity.kt --")
-    process_main_activity_kt(project_dir, module, report, dry_run)
-
-    print(f"\n-- {module}/src/main/java/MainActivity.java --")
-    process_main_activity_java(project_dir, module, report, dry_run)
+    print(f"\n-- {module}/src/main/**/*.java, *.kt --")
+    process_java_kt_sources(project_dir, module, base_package, report, dry_run)
 
     if not skip_cleanup:
         print("\n-- Removing build/ directories --")
@@ -522,6 +526,10 @@ def create_template_bundle(project_dir: Path, module: str, output_dir: Path,
 
     if dry_run:
         print(f"\n=== Dry run: would create {output_dir} ===")
+        print("\n-- gradlew clean --")
+        run_gradlew_clean(project_dir, report, dry_run)
+        if dest.exists():
+            print(f"  would remove existing {dest}")
         print(f"  would copy {project_dir} -> {dest}")
         run_pipeline(dest, module, dry_run, skip_cleanup, report)
         print(f"\n  would write {output_dir / 'templates.json'}")
@@ -529,12 +537,15 @@ def create_template_bundle(project_dir: Path, module: str, output_dir: Path,
         print(f"  would write {dest / 'template' / 'icon.png'}")
         return
 
+    print("\n-- gradlew clean --")
+    run_gradlew_clean(project_dir, report, dry_run)
+
     if dest.exists():
-        print(f"Error: {dest} already exists", file=sys.stderr)
-        sys.exit(1)
+        report.remove(str(dest))
+        shutil.rmtree(dest)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(project_dir, dest, ignore=shutil.ignore_patterns(".git"))
+    shutil.copytree(project_dir, dest, ignore=shutil.ignore_patterns(".git", ".gradle", ".cg", ".idea"))
     report.ok(f"{project_dir} -> {dest}")
 
     run_pipeline(dest, module, dry_run, skip_cleanup, report)

@@ -178,7 +178,8 @@ def process_root_build_gradle(project_dir: Path, report: Report, dry_run: bool):
     write_peb(path, new_text, report, dry_run)
 
 
-def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry_run: bool):
+def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry_run: bool,
+                              wrap_kotlin_in_language_conditional: bool = True):
     path = project_dir / module / "build.gradle.kts"
     if not path.exists():
         path = project_dir / module / "build.gradle"
@@ -249,14 +250,21 @@ def process_app_build_gradle(project_dir: Path, module: str, report: Report, dry
             )
 
     if m:
-        replacement = (
-            f'{indent}${{% if LANGUAGE == \'kotlin\' %}} \n'
-            f'{indent}{plugin_line}\n'
-            f'{indent}${{% endif %}} \n'
-        )
+        if wrap_kotlin_in_language_conditional:
+            replacement = (
+                f'{indent}${{% if LANGUAGE == \'kotlin\' %}} \n'
+                f'{indent}{plugin_line}\n'
+                f'{indent}${{% endif %}} \n'
+            )
+            report.ok(f"{path}: wrapped Kotlin plugin declaration in LANGUAGE conditional")
+        else:
+            replacement = f'{indent}{plugin_line}\n'
+            report.ok(
+                f"{path}: templatized Kotlin plugin version "
+                "(single-language project, no LANGUAGE conditional needed)"
+            )
         text = text[:m.start()] + replacement + text[m.end():]
         total += 1
-        report.ok(f"{path}: wrapped Kotlin plugin declaration in LANGUAGE conditional")
     else:
         report.skip(f"{path}: Kotlin plugin line not found (ok for Java-only projects)")
 
@@ -487,6 +495,16 @@ def flag_personal_info_files(project_dir: Path, report: Report):
             report.flag(f"{f} may contain machine-specific or personal information; review/delete manually")
 
 
+def detect_source_languages(project_dir: Path, module: str) -> set:
+    src_main = project_dir / module / "src" / "main"
+    languages = set()
+    if any(src_main.rglob("*.java")):
+        languages.add("java")
+    if any(src_main.rglob("*.kt")):
+        languages.add("kotlin")
+    return languages
+
+
 def run_pipeline(project_dir: Path, module: str, dry_run: bool, skip_cleanup: bool, report: Report):
     print(f"\n=== Templatizing {project_dir} ===\n")
     if dry_run:
@@ -501,8 +519,11 @@ def run_pipeline(project_dir: Path, module: str, dry_run: bool, skip_cleanup: bo
     print("\n-- build.gradle.kts / build.gradle (root) --")
     process_root_build_gradle(project_dir, report, dry_run)
 
+    languages = detect_source_languages(project_dir, module)
+    is_mixed_language = len(languages) > 1
+
     print(f"\n-- {module}/build.gradle.kts / build.gradle --")
-    base_package = process_app_build_gradle(project_dir, module, report, dry_run)
+    base_package = process_app_build_gradle(project_dir, module, report, dry_run, is_mixed_language)
 
     print(f"\n-- {module}/src/main/res/values/strings.xml --")
     process_strings_xml(project_dir, module, report, dry_run)
@@ -522,6 +543,8 @@ def run_pipeline(project_dir: Path, module: str, dry_run: bool, skip_cleanup: bo
 
         print("\n-- Flagging files that may contain personal information --")
         flag_personal_info_files(project_dir, report)
+
+    return languages
 
 
 # Generic template thumbnail (phone mockup), used as a stand-in until a
@@ -580,7 +603,12 @@ THUMB_PNG_B64 = (
 )
 
 
-def build_template_json() -> dict:
+def build_template_json(include_language: bool = True) -> dict:
+    optional = {}
+    if include_language:
+        optional["language"] = {"identifier": "LANGUAGE"}
+    optional["minsdk"] = {"identifier": "MIN_SDK"}
+
     return {
         "name": "Ext Activity",
         "description": "Creates a new test activity",
@@ -591,10 +619,7 @@ def build_template_json() -> dict:
                 "packageName": {"identifier": "PACKAGE_NAME"},
                 "saveLocation": {"identifier": "SAVE_LOCATION"},
             },
-            "optional": {
-                "language": {"identifier": "LANGUAGE"},
-                "minsdk": {"identifier": "MIN_SDK"},
-            },
+            "optional": optional,
         },
         "system": {
             "agpVersion": {"identifier": "AGP_VERSION"},
@@ -649,7 +674,8 @@ def create_template_bundle(project_dir: Path, module: str, output_dir: Path,
     shutil.copytree(project_dir, dest, ignore=COPY_IGNORE)
     report.ok(f"{project_dir} -> {dest}")
 
-    run_pipeline(dest, module, dry_run, skip_cleanup, report)
+    languages = run_pipeline(dest, module, dry_run, skip_cleanup, report)
+    include_language = len(languages) > 1
 
     templates_json = output_dir / "templates.json"
     templates_json.write_text(
@@ -662,7 +688,9 @@ def create_template_bundle(project_dir: Path, module: str, output_dir: Path,
     template_dir.mkdir(exist_ok=True)
 
     template_json = template_dir / "template.json"
-    template_json.write_text(json.dumps(build_template_json(), indent=4) + "\n", encoding="utf-8")
+    template_json.write_text(
+        json.dumps(build_template_json(include_language), indent=4) + "\n", encoding="utf-8"
+    )
     report.ok(str(template_json))
 
     thumb_png = template_dir / "thumb.png"

@@ -34,7 +34,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-COPY_IGNORE = shutil.ignore_patterns(".git", ".gradle", ".cg", ".idea", ".claude")
+COPY_IGNORE = shutil.ignore_patterns(
+    ".git", ".gradle", ".cg", ".idea", ".claude", ".androidide", "release.properties"
+)
 
 TOKEN = "{name} "  # placeholder, formatted per-use as ${{{{{name}}}}}
 

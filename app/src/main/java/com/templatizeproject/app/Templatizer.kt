@@ -677,6 +677,8 @@ data class ConversionResult(
     val cgtFile: File?,
     val report: Report,
     val languages: Set<String>,
+    /** The templatized project directory (project files + template/), or null for a dry run. */
+    val projectBundleDir: File?,
 )
 
 /**
@@ -708,7 +710,7 @@ fun createTemplateBundle(
             report.ok("would write ${File(outputDir, "templates.json")}")
             report.ok("would write ${File(dest, "template/template.json")}")
             report.ok("would write ${File(dest, "template/thumb.png")}")
-            return ConversionResult(outputDir, File(dest, "template"), null, report, languages)
+            return ConversionResult(outputDir, File(dest, "template"), null, report, languages, null)
         } finally {
             tmpRoot.deleteRecursively()
         }
@@ -748,7 +750,7 @@ fun createTemplateBundle(
     zipDirectory(outputDir, cgtFile)
     report.ok("$cgtFile")
 
-    return ConversionResult(outputDir, templateDir, cgtFile, report, languages)
+    return ConversionResult(outputDir, templateDir, cgtFile, report, languages, dest)
 }
 
 /** Zips the contents of [sourceDir] (not the directory itself) into [destZip], storing only files at max compression. */
@@ -765,4 +767,21 @@ private fun zipDirectory(sourceDir: File, destZip: File) {
                 zos.closeEntry()
             }
     }
+}
+
+/** Where Code On the Go (AndroidIDE) looks for installed .cgt templates. */
+private const val ANDROIDIDE_TEMPLATES_DIR = "/data/data/com.itsaky.androidide/files/home/.cg/templates"
+
+/**
+ * Installs a converted template directly into Code On the Go by zipping
+ * [projectBundleDir] (the templatized project + its template/ subfolder) into
+ * the IDE's own templates directory as `<projectName>.cgt`.
+ */
+fun installTemplate(projectBundleDir: File, projectName: String, onLine: (String) -> Unit = {}): File {
+    val targetDir = File(ANDROIDIDE_TEMPLATES_DIR)
+    targetDir.mkdirs()
+    val installedCgt = File(targetDir, "$projectName.cgt")
+    zipDirectory(projectBundleDir, installedCgt)
+    onLine("[OK]      $installedCgt")
+    return installedCgt
 }

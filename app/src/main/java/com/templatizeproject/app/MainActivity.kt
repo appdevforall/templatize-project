@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -34,6 +35,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -105,6 +107,11 @@ fun ConverterScreen() {
     val logLines = remember { mutableStateListOf<String>() }
     var summary by remember { mutableStateOf<String?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var installMessage by remember { mutableStateOf<String?>(null) }
+
+    // Set once a real (non-dry-run) conversion finishes, to drive the "install this
+    // template?" prompt; cleared as soon as the user answers.
+    var pendingInstall by remember { mutableStateOf<Pair<File, String>?>(null) }
 
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
@@ -225,8 +232,11 @@ fun ConverterScreen() {
                         onClick = {
                             errorMessage = null
                             summary = null
+                            installMessage = null
+                            pendingInstall = null
                             logLines.clear()
-                            val dir = File(PROJECTS_DIR, projectName.trim())
+                            val projectDirName = projectName.trim()
+                            val dir = File(PROJECTS_DIR, projectDirName)
                             val name = templateName.trim()
                             if (projectName.isBlank() || !dir.isDirectory) {
                                 errorMessage = "\"$dir\" is not a directory that exists on this device."
@@ -258,6 +268,9 @@ fun ConverterScreen() {
                                         append("${result.report.flagged.size} to review.\n")
                                         append("Bundle: ${result.outputDir}")
                                         if (result.cgtFile != null) append("\n.cgt file: ${result.cgtFile}")
+                                    }
+                                    if (result.projectBundleDir != null) {
+                                        pendingInstall = result.projectBundleDir to projectDirName
                                     }
                                 } catch (e: Exception) {
                                     errorMessage = "Conversion failed: ${e.message}"
@@ -295,6 +308,18 @@ fun ConverterScreen() {
                 }
             }
 
+            installMessage?.let { message ->
+                item {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+                    ) {
+                        Text(message, modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+
             item {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text("Log", style = MaterialTheme.typography.titleSmall)
@@ -308,6 +333,36 @@ fun ConverterScreen() {
                     modifier = Modifier.padding(vertical = 1.dp),
                 )
             }
+        }
+
+        pendingInstall?.let { (bundleDir, installName) ->
+            AlertDialog(
+                onDismissRequest = { pendingInstall = null },
+                title = { Text("Install template?") },
+                text = { Text("Do you wish to install this template?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        pendingInstall = null
+                        scope.launch {
+                            try {
+                                val installed = withContext(Dispatchers.IO) {
+                                    installTemplate(bundleDir, installName) { line -> logLines.add(line) }
+                                }
+                                installMessage = "Installed template: $installed"
+                            } catch (e: Exception) {
+                                installMessage = "Install failed: ${e.message}"
+                            }
+                        }
+                    }) {
+                        Text("Yes")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingInstall = null }) {
+                        Text("No")
+                    }
+                },
+            )
         }
     }
 }

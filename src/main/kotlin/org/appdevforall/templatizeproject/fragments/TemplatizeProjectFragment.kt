@@ -3,6 +3,8 @@ package org.appdevforall.templatizeproject.fragments
 import android.app.AlertDialog
 import android.graphics.Color
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -44,6 +46,8 @@ class TemplatizeProjectFragment : Fragment() {
     private var statusText: TextView? = null
     private var logText: TextView? = null
 
+    private var isRunning = false
+
     override fun onGetLayoutInflater(savedInstanceState: Bundle?): LayoutInflater {
         val inflater = super.onGetLayoutInflater(savedInstanceState)
         return PluginFragmentHelper.getPluginInflater(PLUGIN_ID, inflater)
@@ -72,6 +76,21 @@ class TemplatizeProjectFragment : Fragment() {
 
         convertButton?.setOnClickListener { onConvertClicked() }
         browseProjectsButton?.setOnClickListener { showProjectPicker() }
+
+        val watcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) = updateConvertButtonState()
+        }
+        projectNameInput?.addTextChangedListener(watcher)
+        templateNameInput?.addTextChangedListener(watcher)
+        updateConvertButtonState()
+    }
+
+    private fun updateConvertButtonState() {
+        val projectName = projectNameInput?.text?.toString()?.trim().orEmpty()
+        val templateName = templateNameInput?.text?.toString()?.trim().orEmpty()
+        convertButton?.isEnabled = !isRunning && projectName.isNotEmpty() && templateName.isNotEmpty()
     }
 
     private fun showProjectPicker() {
@@ -198,13 +217,14 @@ class TemplatizeProjectFragment : Fragment() {
     }
 
     private fun setRunning(running: Boolean) {
+        isRunning = running
         progressBar?.visibility = if (running) View.VISIBLE else View.GONE
-        convertButton?.isEnabled = !running
         projectNameInput?.isEnabled = !running
         browseProjectsButton?.isEnabled = !running
         templateNameInput?.isEnabled = !running
         dryRunCheckbox?.isEnabled = !running
         skipCleanupCheckbox?.isEnabled = !running
+        updateConvertButtonState()
     }
 
     override fun onDestroyView() {

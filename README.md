@@ -1,21 +1,22 @@
 # Templatize Project
 
-An Android app (Kotlin + Jetpack Compose) that packages an Android Studio
-project into a [Code On the Go](https://codeonthego.app/) (`.cgt`) template
-bundle by applying the substitutions described in "Template Creation and
-Installation". It's meant to be built and run on-device, e.g. from inside
-Code On the Go itself, so a project can be templatized without leaving the
-IDE. The original project directory is never modified — the app copies it
-into a new bundle directory next to it and templatizes the copy.
+A [Code On the Go](https://github.com/appdevforall/CodeOnTheGo) plugin (CGP)
+that converts an Android Studio project into a Code On the Go (`.cgt`)
+template bundle by applying the substitutions described in "Template
+Creation and Installation" — driven entirely from a tab inside the IDE
+itself, with an option to install the result straight into the IDE's
+template picker. The original project directory is never modified — the
+plugin copies it into a new bundle directory next to it and templatizes the
+copy.
 
-This is a Kotlin port of what was previously a standalone
-`templatize_project.py` script; the substitution logic and output layout are
-the same, just driven from a UI and running as an on-device app instead of a
-desktop CLI.
+This started as a `templatize_project.py` desktop script, was ported to a
+standalone Kotlin/Compose Android app, and is now a proper Code On the Go
+plugin so it runs inside the IDE with no separate app to install.
 
 ## UI
 
-Launching the app shows a form with:
+The plugin adds a **Templatize Project** item to the IDE's sidebar (under
+"tools"), which opens a tab with:
 
 - **Project name to convert** — the project's directory name under
   `/sdcard/CodeOnTheGoProjects` (Code On the Go's fixed projects root), e.g.
@@ -23,19 +24,17 @@ Launching the app shows a form with:
 - **Template name** — written into the generated `template.json`'s `name`
   field, and used as the template subdirectory / `templates.json` `path`
   entry.
-- **App module directory** — defaults to `app`.
 - **Dry run** — preview the substitutions against a disposable copy without
   writing or deleting anything.
 - **Skip cleanup** — skip `build/` and keystore removal.
 
-On first launch the app requests storage access (All Files Access on
-Android 11+, legacy read/write permissions below that), since it needs to
-read and write project files anywhere on device storage.
-
 Tapping **Convert to .cgt template** runs the pipeline on a background
 thread and streams a live log (mirroring the old CLI's `[OK]` / `[SKIP]` /
-`[REMOVED]` / `[REVIEW]` output) into a scrollable list, followed by a
-summary card with the output paths.
+`[REMOVED]` / `[REVIEW]` output), followed by a summary with the output
+paths. On a real (non-dry-run) conversion, it then asks **"Do you wish to
+install this template?"** — answering Yes registers the `.cgt` directly with
+the IDE via `IdeTemplateService`, so it shows up immediately in the New
+Project / New File template picker.
 
 ## What the conversion does
 
@@ -63,6 +62,8 @@ For each run, it:
    set to the entered template name) and a placeholder `thumb.png` (replace
    with a real thumbnail before shipping).
 6. Zips the output directory into a `<template-name>.cgt` file next to it.
+7. If the user opts in, registers that `.cgt` with the IDE via
+   `IdeTemplateService.registerTemplate(...)`.
 
 Both Kotlin DSL (`build.gradle.kts`) and Groovy DSL (`build.gradle`) projects
 are supported.
@@ -79,6 +80,8 @@ are supported.
 - `<module>/src/main/**/*.java`, `*.kt` — package name (declarations and
   imports), plus flattening the package directory tree into `PACKAGE_NAME`
 
+Assumes the app module is named `app`.
+
 ## Pebble whitespace quirk
 
 A line/segment that ends with a Pebble token must be followed by at least
@@ -89,19 +92,28 @@ immediately followed by one, so the quote itself isn't eaten.
 
 ## Project layout
 
-- `Templatizer.kt` — the substitution pipeline (Kotlin port of the former
-  Python script's logic), plus the `.cgt` bundle writer/zipper.
-- `MainActivity.kt` — the Compose UI: input form, permission handling,
-  background execution, and live log/result display.
+- `Templatizer.kt` — the substitution pipeline, pure `java.io.File` logic
+  with no dependency on the plugin API (so it's easy to reason about and
+  test in isolation), plus the `.cgt` bundle writer/zipper.
+- `TemplatizeProjectPlugin.kt` — the `IPlugin` entry point: registers the
+  sidebar item and the main editor tab, and provides in-IDE tooltip help.
+- `fragments/TemplatizeProjectFragment.kt` — the tab's UI: the input form,
+  background execution, live log, and the install-template confirmation
+  flow via `IdeTemplateService`.
+- `libs/plugin-api.jar`, `libs/gradle-plugin.jar` — Code On the Go's plugin
+  SDK and plugin-builder Gradle plugin (`com.itsaky.androidide.plugins.build`).
+  Not published to Maven Central; copied from a working Code On the Go
+  plugin checkout. Refresh by rebuilding them from a CodeOnTheGo source
+  checkout if the plugin API changes upstream.
 
 ## Building
 
 ```
-./gradlew assembleDebug
+./gradlew assemblePlugin        # release .cgp -> build/plugin/templatize-project.cgp
+./gradlew assemblePluginDebug   # debug .cgp   -> build/plugin/templatize-project-debug.cgp
 ```
 
-The resulting APK can be installed and run like any other Android app,
-including inside Code On the Go's own build/run flow.
+Install the resulting `.cgp` through Code On the Go's Plugin Manager.
 
 ## Next steps
 

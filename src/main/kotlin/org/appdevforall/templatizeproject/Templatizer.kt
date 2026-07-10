@@ -1,4 +1,4 @@
-package com.templatizeproject.app
+package org.appdevforall.templatizeproject
 
 import android.util.Base64
 import org.json.JSONObject
@@ -7,11 +7,12 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 /**
- * Kotlin port of templatize_project.py: turns an Android Studio project into
- * a Code On the Go (.cgt) template bundle by substituting concrete values
- * (versions, package name, app name, SDK levels, Java compat levels) with
- * Pebble tokens (${{ TOKEN }}), then writing templates.json and
- * template/template.json alongside a thumbnail.
+ * Turns an Android Studio project into a Code On the Go (.cgt) template
+ * bundle by substituting concrete values (versions, package name, app name,
+ * SDK levels, Java compatibility levels) with Pebble tokens (${{ TOKEN }}),
+ * then writing templates.json and template/template.json alongside a
+ * thumbnail. Pure file-I/O logic with no dependency on the plugin API, so it
+ * can be unit-tested and called directly from the plugin's UI layer.
  */
 
 /** Directory/file names skipped when copying the source project into the bundle. */
@@ -489,33 +490,6 @@ private fun cleanupKeystores(projectDir: File, report: Report, dryRun: Boolean) 
         }
 }
 
-/** Best-effort `gradlew clean`; skipped silently if the wrapper is missing or fails to run in this sandbox. */
-private fun runGradlewClean(projectDir: File, report: Report, dryRun: Boolean) {
-    val gradlew = File(projectDir, "gradlew")
-    if (!gradlew.exists()) {
-        report.skip("$gradlew not found, skipping gradlew clean")
-        return
-    }
-    if (dryRun) {
-        report.ok("would run $gradlew clean")
-        return
-    }
-    try {
-        val process = ProcessBuilder(gradlew.absolutePath, "clean")
-            .directory(projectDir)
-            .redirectErrorStream(true)
-            .start()
-        val exit = process.waitFor()
-        if (exit == 0) {
-            report.ok("$gradlew clean")
-        } else {
-            report.skip("$gradlew clean exited with code $exit, continuing anyway")
-        }
-    } catch (e: Exception) {
-        report.skip("$gradlew clean could not be run in this environment (${e.message}), continuing anyway")
-    }
-}
-
 private fun flagPersonalInfoFiles(projectDir: File, report: Report) {
     val candidates = listOf("local.properties", "google-services.json", "key.properties", "GoogleService-Info.plist")
     for (name in candidates) {
@@ -698,8 +672,6 @@ fun createTemplateBundle(
     val outputDir = File(projectDir.parentFile, "${projectDir.name}-cgt")
     val dest = File(outputDir, templateName)
 
-    runGradlewClean(projectDir, report, dryRun)
-
     if (dryRun) {
         // Preview against a disposable copy so a dry run never touches the real output path.
         val tmpRoot = File.createTempFile("cgt-dryrun", "").apply { delete(); mkdirs() }
@@ -767,21 +739,4 @@ private fun zipDirectory(sourceDir: File, destZip: File) {
                 zos.closeEntry()
             }
     }
-}
-
-/** Where Code On the Go (AndroidIDE) looks for installed .cgt templates. */
-private const val ANDROIDIDE_TEMPLATES_DIR = "/data/data/com.itsaky.androidide/files/home/.cg/templates"
-
-/**
- * Installs a converted template directly into Code On the Go by zipping
- * [projectBundleDir] (the templatized project + its template/ subfolder) into
- * the IDE's own templates directory as `<projectName>.cgt`.
- */
-fun installTemplate(projectBundleDir: File, projectName: String, onLine: (String) -> Unit = {}): File {
-    val targetDir = File(ANDROIDIDE_TEMPLATES_DIR)
-    targetDir.mkdirs()
-    val installedCgt = File(targetDir, "$projectName.cgt")
-    zipDirectory(projectBundleDir, installedCgt)
-    onLine("[OK]      $installedCgt")
-    return installedCgt
 }
